@@ -44,7 +44,7 @@ def valid_url(value: str) -> bool:
         return False
 
 
-def download_media(url: str, folder: str, audio_only: bool = False) -> tuple[str, dict]:
+def download_media(url: str, folder: str, audio_only: bool = False, video_quality: str = "720") -> tuple[str, dict]:
     output_template = str(Path(folder) / "%(title).80s-%(id)s.%(ext)s")
     is_instagram = "instagram.com" in (urlparse(url).hostname or "").lower()
     options = {
@@ -63,11 +63,11 @@ def download_media(url: str, folder: str, audio_only: bool = False) -> tuple[str
         "format": (
             "bestaudio[filesize<=49M]/bestaudio/best"
             if audio_only else
-            "best[height<=720][ext=mp4][filesize<=49M]/"
-            "best[height<=720][filesize<=49M]/"
-            "best[filesize<=49M]/best[height<=720]/best"
+            f"best[height<={video_quality}][ext=mp4][filesize<=49M]/"
+            f"best[height<={video_quality}][filesize<=49M]/"
+            f"best[height<={video_quality}]/best"
         ),
-        "format_sort": ["abr", "ext:m4a"] if audio_only else ["res:720", "ext:mp4:m4a"],
+        "format_sort": ["abr", "ext:m4a"] if audio_only else [f"res:{video_quality}", "ext:mp4:m4a"],
         "outtmpl": output_template,
         "noplaylist": True,
         "max_filesize": MAX_FILE_SIZE,
@@ -228,22 +228,55 @@ async def handle_download_choice(update: Update, context: ContextTypes.DEFAULT_T
     if not query:
         return
     await query.answer()
+
     try:
-        action, media_type, token = query.data.split(":", 2)
-    except (AttributeError, ValueError):
+        parts = query.data.split(":")
+        action = parts[0]
+        choice = parts[1]
+        token = parts[-1]
+    except (AttributeError, IndexError):
         await query.edit_message_text("❌ الاختيار غير صالح. ابعت الرابط مرة تانية.")
         return
 
     pending = context.user_data.get("pending_downloads", {})
-    url = pending.pop(token, None)
-    if action != "download" or media_type not in ("video", "audio") or not url:
+    url = pending.get(token)
+    if action != "download" or not url:
         await query.edit_message_text("انتهت صلاحية الاختيار. ابعت الرابط مرة تانية.")
         return
 
-    audio_only = media_type == "audio"
+    # Video selection opens a quality menu; download starts after a quality is chosen.
+    if choice == "video":
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("360p", callback_data=f"download:q360:{token}"),
+                InlineKeyboardButton("480p", callback_data=f"download:q480:{token}"),
+            ],
+            [
+                InlineKeyboardButton("720p HD", callback_data=f"download:q720:{token}"),
+                InlineKeyboardButton("1080p Full HD", callback_data=f"download:q1080:{token}"),
+            ],
+            [InlineKeyboardButton("⭐ أعلى جودة متاحة", callback_data=f"download:qbest:{token}")],
+        ])
+        await query.edit_message_text("اختار جودة الفيديو المطلوبة:", reply_markup=keyboard)
+        return
+
+    if choice == "audio":
+        audio_only = True
+        video_quality = "720"
+    elif choice.startswith("q"):
+        audio_only = False
+        video_quality = {"q360": "360", "q480": "480", "q720": "720", "q1080": "1080", "qbest": "best"}.get(choice)
+        if not video_quality:
+            await query.edit_message_text("❌ الجودة المختارة غير صالحة.")
+            return
+    else:
+        await query.edit_message_text("❌ الاختيار غير صالح.")
+        return
+
+    pending.pop(token, None)
     await query.edit_message_text(
         "⏳ جاري تحميل الصوت وتحويله إلى MP3..." if audio_only
-        else "⏳ جاري تحميل الفيديو..."
+        else f"⏳ جاري تحميل الفيديو بجودة {video_quality if video_quality != 'best' else 'أعلى جودة متاحة'}..."
     )
     await context.bot.send_chat_action(
         chat_id=query.message.chat_id,
@@ -252,7 +285,9 @@ async def handle_download_choice(update: Update, context: ContextTypes.DEFAULT_T
 
     try:
         with tempfile.TemporaryDirectory(prefix="telegram-media-") as folder:
-            filename, info = await asyncio.to_thread(download_media, url, folder, audio_only)
+            filename, info = await asyncio.to_thread(
+                download_media, url, folder, audio_only, video_quality
+            )
             title = (info.get("title") or "الملف")[:900]
             with open(filename, "rb") as media:
                 if audio_only:
@@ -266,7 +301,7 @@ async def handle_download_choice(update: Update, context: ContextTypes.DEFAULT_T
                 else:
                     await query.message.reply_video(
                         video=media,
-                        caption=title,
+                        caption=f"{title} | الجودة المطلوبة: {video_quality if video_quality != 'best' else 'أعلى جودة متاحة'}",
                         supports_streaming=True,
                         read_timeout=180,
                         write_timeout=180,
@@ -275,10 +310,8 @@ async def handle_download_choice(update: Update, context: ContextTypes.DEFAULT_T
             await query.edit_message_text("✅ تم التحميل والإرسال بنجاح.")
     except yt_dlp.utils.DownloadError as exc:
         error_text = str(exc)
-        logger.error("yt-dlp %s download failed: %s", media_type, error_text, exc_info=True)
+        logger.error("yt-dlp %s download failed: %s", "audio" if audio_only else "video", error_text, exc_info=True)
 
-        # YouTube may challenge cloud-hosted IPs even for public videos.
-        # Do not claim this is a bot/deployment failure or silently retry forever.
         if "Sign in to confirm you're not a bot" in error_text or (
             "youtube" in error_text.lower() and "cookies" in error_text.lower()
         ):
@@ -289,14 +322,14 @@ async def handle_download_choice(update: Update, context: ContextTypes.DEFAULT_T
             )
         else:
             user_message = (
-                "❌ المنصة رفضت التحميل أو تعذّر استخراج الملف. "
-                "جرّب رابطًا عامًا آخر."
+                "❌ المنصة رفضت التحميل أو الجودة المطلوبة غير متاحة. "
+                "جرّب جودة أقل أو رابطًا عامًا آخر."
             )
         await query.edit_message_text(user_message)
     except ValueError as exc:
         await query.edit_message_text(f"❌ {exc}")
     except Exception:
-        logger.exception("Unexpected error while downloading/sending %s", media_type)
+        logger.exception("Unexpected error while downloading/sending media")
         await query.edit_message_text(
             "❌ حصل خطأ أثناء التحميل أو الإرسال. جرّب رابطًا آخر."
         )
