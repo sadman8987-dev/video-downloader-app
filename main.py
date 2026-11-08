@@ -1,4 +1,6 @@
 import asyncio
+import base64
+import binascii
 import logging
 import os
 import tempfile
@@ -80,6 +82,21 @@ def download_video(url: str, folder: str) -> tuple[str, dict]:
         "fragment_retries": 3,
         "continuedl": True,
     }
+
+    # Optional Instagram session cookies. Store the base64-encoded Netscape
+    # cookies.txt content in Railway as INSTAGRAM_COOKIES_BASE64. Never log it.
+    if is_instagram:
+        encoded_cookies = os.getenv("INSTAGRAM_COOKIES_BASE64", "").strip()
+        if encoded_cookies:
+            cookie_path = Path(folder) / "instagram-cookies.txt"
+            try:
+                cookie_bytes = base64.b64decode(encoded_cookies, validate=True)
+                if not cookie_bytes.startswith(b"# Netscape HTTP Cookie File") and not cookie_bytes.startswith(b"# HTTP Cookie File"):
+                    raise ValueError("Instagram cookies must use Netscape cookies.txt format")
+                cookie_path.write_bytes(cookie_bytes)
+                options["cookiefile"] = str(cookie_path)
+            except (binascii.Error, ValueError, OSError):
+                logger.exception("Invalid INSTAGRAM_COOKIES_BASE64; continuing without Instagram cookies")
 
     with yt_dlp.YoutubeDL(options) as ydl:
         info = ydl.extract_info(url, download=True)
