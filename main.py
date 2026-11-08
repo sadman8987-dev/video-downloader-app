@@ -247,10 +247,25 @@ async def handle_download_choice(update: Update, context: ContextTypes.DEFAULT_T
                     )
             await query.edit_message_text("✅ تم التحميل والإرسال بنجاح.")
     except yt_dlp.utils.DownloadError as exc:
-        logger.exception("yt-dlp %s download failed: %s", media_type, exc)
-        await query.edit_message_text(
-            "❌ المنصة رفضت التحميل أو تعذّر استخراج الملف. جرّب رابطًا عامًا آخر."
-        )
+        error_text = str(exc)
+        logger.error("yt-dlp %s download failed: %s", media_type, error_text, exc_info=True)
+
+        # YouTube may challenge cloud-hosted IPs even for public videos.
+        # Do not claim this is a bot/deployment failure or silently retry forever.
+        if "Sign in to confirm you're not a bot" in error_text or (
+            "youtube" in error_text.lower() and "cookies" in error_text.lower()
+        ):
+            user_message = (
+                "⚠️ يوتيوب رفض إتاحة الفيديو للسيرفر وطلب تسجيل دخول/تحقق.\n"
+                "البوت شغال، لكن الفيديو ده غير متاح للتنزيل حاليًا من بيئة الاستضافة.\n"
+                "جرّب رابط يوتيوب عام آخر، أو جرّب منصة مدعومة أخرى."
+            )
+        else:
+            user_message = (
+                "❌ المنصة رفضت التحميل أو تعذّر استخراج الملف. "
+                "جرّب رابطًا عامًا آخر."
+            )
+        await query.edit_message_text(user_message)
     except ValueError as exc:
         await query.edit_message_text(f"❌ {exc}")
     except Exception:
