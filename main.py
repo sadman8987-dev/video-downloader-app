@@ -47,6 +47,7 @@ def valid_url(value: str) -> bool:
 def download_media(url: str, folder: str, audio_only: bool = False, video_quality: str = "720") -> tuple[str, dict]:
     output_template = str(Path(folder) / "%(title).80s-%(id)s.%(ext)s")
     is_instagram = "instagram.com" in (urlparse(url).hostname or "").lower()
+    quality_filter = "" if video_quality == "best" else f"[height<={video_quality}]"
     options = {
         "http_headers": (
             {
@@ -63,11 +64,11 @@ def download_media(url: str, folder: str, audio_only: bool = False, video_qualit
         "format": (
             "bestaudio[filesize<=49M]/bestaudio/best"
             if audio_only else
-            f"best[height<={video_quality}][ext=mp4][filesize<=49M]/"
-            f"best[height<={video_quality}][filesize<=49M]/"
-            f"best[height<={video_quality}]/best"
+            f"best{quality_filter}[ext=mp4][filesize<=49M]/"
+            f"best{quality_filter}[filesize<=49M]/"
+            f"best{quality_filter}/best"
         ),
-        "format_sort": ["abr", "ext:m4a"] if audio_only else [f"res:{video_quality}", "ext:mp4:m4a"],
+        "format_sort": ["abr", "ext:m4a"] if audio_only else (["ext:mp4:m4a"] if video_quality == "best" else [f"res:{video_quality}", "ext:mp4:m4a"]),
         "outtmpl": output_template,
         "noplaylist": True,
         "max_filesize": MAX_FILE_SIZE,
