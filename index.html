@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#101827"><meta name="description" content="أداة بسيطة لحفظ الفيديوهات التي تملك حق تنزيلها">
+<link rel="manifest" href="manifest.webmanifest">
+<title>Video Saver | حفظ الفيديو</title>
+<style>
+:root{color-scheme:dark;--bg:#0b1220;--card:#121e31;--muted:#9aabc2;--accent:#38d39f;--line:#26364d}
+*{box-sizing:border-box}body{margin:0;min-height:100vh;background:radial-gradient(ellipse at top,#1c3550,var(--bg) 60%);font-family:system-ui,"Segoe UI",Tahoma,sans-serif;color:#f4f7fb;display:grid;place-items:center;padding:22px}
+main{width:min(100%,520px)}.brand{text-align:center;margin-bottom:22px}.logo{font-size:42px}.brand h1{margin:8px 0;font-size:30px}.brand p{color:var(--muted);margin:0}
+.card{background:linear-gradient(145deg,#17263b,#101a2b);border:1px solid var(--line);border-radius:24px;padding:24px;box-shadow:0 18px 55px #0006}
+label{display:block;font-weight:700;margin:0 0 10px}input{width:100%;padding:16px;border:1px solid #344760;border-radius:13px;background:#091321;color:white;font-size:16px;outline:none;direction:ltr;text-align:left}input:focus{border-color:var(--accent)}
+button,.secondary{width:100%;border:0;border-radius:13px;padding:15px 18px;font-size:16px;font-weight:800;cursor:pointer;text-decoration:none;display:block;text-align:center}
+.primary{background:var(--accent);color:#062319;margin-top:14px}.secondary{background:#243750;color:#f4f7fb;margin-top:10px}
+.note{font-size:13px;line-height:1.8;color:var(--muted);margin:18px 2px 0}.status{min-height:24px;color:var(--accent);font-size:14px;margin-top:10px}
+.features{display:flex;gap:8px;flex-wrap:wrap;margin-top:18px}.pill{font-size:12px;color:#c4d4e7;border:1px solid var(--line);padding:7px 10px;border-radius:99px}
+footer{text-align:center;color:#71839b;font-size:12px;margin:18px 0}
+</style>
+</head>
+<body>
+<main>
+<header class="brand"><div class="logo">⬇️</div><h1>Video Saver</h1><p>احفظ الفيديوهات المسموح لك بتنزيلها بسهولة</p></header>
+<section class="card">
+<label for="videoUrl">حط رابط الفيديو هنا</label>
+<input id="videoUrl" type="url" inputmode="url" placeholder="https://example.com/video" autocomplete="url">
+<button class="primary" id="copyBtn">نسخ الرابط وفتح SaveFrom</button>
+<a class="secondary" href="https://en1.savefrom.net/19wr/" target="_blank" rel="noopener noreferrer">فتح SaveFrom مباشرة</a>
+<div class="status" id="status" role="status" aria-live="polite"></div>
+<div class="features"><span class="pill">📱 مناسب للموبايل</span><span class="pill">⚡ خفيف وسريع</span><span class="pill">🌐 قابل للتثبيت</span></div>
+<p class="note">بعد الضغط، سيتم نسخ الرابط وفتح خدمة SaveFrom في صفحة جديدة؛ الصق الرابط هناك واختر الجودة المتاحة. نزّل فقط الفيديوهات التي تملكها أو لديك إذن بتنزيلها، والتزم بشروط المنصة وحقوق أصحاب المحتوى. التطبيق لا يتجاوز تسجيل الدخول أو الحماية أو القيود التقنية.</p>
+</section>
+<footer>Video Saver · أداة مساعدة مستقلة وليست تابعة لـ SaveFrom</footer>
+</main>
+<script>
+const input=document.getElementById('videoUrl'),status=document.getElementById('status');
+document.getElementById('copyBtn').addEventListener('click',async()=>{
+ const value=input.value.trim();
+ if(!value){status.textContent='من فضلك حط رابط الفيديو الأول.';input.focus();return}
+ try{const u=new URL(value);if(!['http:','https:'].includes(u.protocol))throw new Error()}
+ catch{status.textContent='الرابط غير صحيح. استخدم رابط يبدأ بـ https://';return}
+ try{await navigator.clipboard.writeText(value);status.textContent='تم نسخ الرابط. الصقه في صفحة SaveFrom التي اتفتحت.'}
+ catch{status.textContent='انسخ الرابط يدويًا ثم الصقه في SaveFrom.'}
+ window.open('https://en1.savefrom.net/19wr/','_blank','noopener');
+});
+if('serviceWorker' in navigator)window.addEventListener('load',()=>navigator.serviceWorker.register('./sw.js').catch(()=>{}));
+</script>
+</body></html>
