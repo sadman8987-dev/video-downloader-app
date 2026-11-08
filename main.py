@@ -42,10 +42,8 @@ def valid_url(value: str) -> bool:
 
 def download_video(url: str, folder: str) -> tuple[str, dict]:
     output_template = str(Path(folder) / "%(title).80s-%(id)s.%(ext)s")
+    is_instagram = "instagram.com" in (urlparse(url).hostname or "").lower()
     options = {
-        # Instagram may serve a login/challenge page to server-side requests.
-        # Browser-like headers can help with public Reels, but cannot bypass
-        # private posts, login walls, or Instagram IP rate limits.
         "http_headers": (
             {
                 "User-Agent": (
@@ -56,11 +54,8 @@ def download_video(url: str, folder: str) -> tuple[str, dict]:
                 "Accept-Language": "en-US,en;q=0.9",
                 "Referer": "https://www.instagram.com/",
             }
-            if "instagram.com" in (urlparse(url).hostname or "").lower()
-            else {}
+            if is_instagram else {}
         ),
-        # Prefer MP4 and a manageable resolution/size, then fall back to
-        # the best available format. The final size is checked after download.
         "format": (
             "best[height<=720][ext=mp4][filesize<=49M]/"
             "best[height<=720][filesize<=49M]/"
@@ -78,7 +73,7 @@ def download_video(url: str, folder: str) -> tuple[str, dict]:
         "js_runtimes": {"deno": {}},
         "remote_components": ["ejs:github"],
         "quiet": True,
-        "no_warnings": True,
+        "no_warnings": False,
         "restrictfilenames": True,
         "socket_timeout": 30,
         "retries": 3,
@@ -88,22 +83,53 @@ def download_video(url: str, folder: str) -> tuple[str, dict]:
 
     with yt_dlp.YoutubeDL(options) as ydl:
         info = ydl.extract_info(url, download=True)
-        prepared = Path(ydl.prepare_filename(info))
 
-    if prepared.exists():
-        final_path = prepared
-    else:
-        # FFmpeg may change the extension during format merging.
-        candidates = [
-            p for p in Path(folder).glob("*")
-            if p.is_file() and p.suffix.lower() in {
-                ".mp4", ".mkv", ".webm", ".mov", ".m4v"
-            }
-        ]
-        if not candidates:
-            raise FileNotFoundError("Downloaded media file was not found")
-        final_path = max(candidates, key=lambda p: p.stat().st_mtime)
+    # prepare_filename() may return the pre-merge extension (for example
+    # .webm) while FFmpeg writes the final file as .mp4. Prefer yt-dlp's
+    # actual requested_downloads filepath, then search the temp directory.
+    candidates = []
+    for entry in info.get("requested_downloads") or []:
+        for key in ("filepath", "_filename", "filename"):
+            value = entry.get(key)
+            if value:
+                candidates.append(Path(value))
 
+    for key in ("filepath", "_filename"):
+        value = info.get(key)
+        if value:
+            candidates.append(Path(value))
+
+    candidates.extend(
+        p for p in Path(folder).rglob("*")
+        if p.is_file() and p.suffix.lower() in {
+            ".mp4", ".mkv", ".webm", ".mov", ".m4v"
+        }
+    )
+
+    existing = []
+    seen = set()
+    for path in candidates:
+        try:
+            resolved = path.resolve()
+            if resolved not in seen and resolved.is_file():
+                seen.add(resolved)
+                existing.append(resolved)
+        except OSError:
+            continue
+
+    if not existing:
+        files_found = [str(p.name) for p in Path(folder).rglob("*") if p.is_file()]
+        logger.error(
+            "yt-dlp returned without a discoverable media file. extractor=%s "
+            "id=%s requested_downloads=%r files_in_temp=%r",
+            info.get("extractor"), info.get("id"),
+            info.get("requested_downloads"), files_found,
+        )
+        raise FileNotFoundError(
+            "yt-dlp did not produce a media file; see extractor details in Railway logs"
+        )
+
+    final_path = max(existing, key=lambda p: p.stat().st_mtime)
     if final_path.stat().st_size > MAX_FILE_SIZE:
         raise ValueError("حجم الفيديو أكبر من 49 ميجابايت. جرّب فيديو أقصر أو أقل جودة.")
 
