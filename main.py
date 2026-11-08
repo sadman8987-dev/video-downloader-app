@@ -123,7 +123,8 @@ def download_media(url: str, folder: str, audio_only: bool = False, video_qualit
     if is_youtube:
         options["extractor_args"] = {
             "youtubepot-bgutilhttp": {
-                "base_url": [os.getenv("BGUTIL_POT_BASE_URL", "http://bgutil-pot-provider.railway.internal:4416")]
+                "base_url": [os.getenv("BGUTIL_POT_BASE_URL", "http://bgutil-pot-provider.railway.internal:4416")],
+                "disable_innertube": ["1"],
             }
         }
         encoded_cookies = os.getenv("YOUTUBE_COOKIES_BASE64", "").strip()
