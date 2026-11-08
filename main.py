@@ -43,6 +43,22 @@ def valid_url(value: str) -> bool:
 def download_video(url: str, folder: str) -> tuple[str, dict]:
     output_template = str(Path(folder) / "%(title).80s-%(id)s.%(ext)s")
     options = {
+        # Instagram may serve a login/challenge page to server-side requests.
+        # Browser-like headers can help with public Reels, but cannot bypass
+        # private posts, login walls, or Instagram IP rate limits.
+        "http_headers": (
+            {
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/131.0.0.0 Safari/537.36"
+                ),
+                "Accept-Language": "en-US,en;q=0.9",
+                "Referer": "https://www.instagram.com/",
+            }
+            if "instagram.com" in (urlparse(url).hostname or "").lower()
+            else {}
+        ),
         # Prefer MP4 and a manageable resolution/size, then fall back to
         # the best available format. The final size is checked after download.
         "format": (
