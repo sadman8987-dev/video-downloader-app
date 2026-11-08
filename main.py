@@ -4,6 +4,7 @@ import binascii
 import logging
 import os
 import secrets
+import subprocess
 import tempfile
 from pathlib import Path
 from urllib.parse import urlparse
@@ -47,6 +48,7 @@ def valid_url(value: str) -> bool:
 def download_media(url: str, folder: str, audio_only: bool = False, video_quality: str = "720") -> tuple[str, dict]:
     output_template = str(Path(folder) / "%(title).80s-%(id)s.%(ext)s")
     is_instagram = "instagram.com" in (urlparse(url).hostname or "").lower()
+    instagram_cookie_path = None
     quality_filter = "" if video_quality == "best" else f"[height<={video_quality}]"
     options = {
         "http_headers": (
@@ -104,6 +106,7 @@ def download_media(url: str, folder: str, audio_only: bool = False, video_qualit
                 if not cookie_bytes.startswith(b"# Netscape HTTP Cookie File") and not cookie_bytes.startswith(b"# HTTP Cookie File"):
                     raise ValueError("Instagram cookies must use Netscape cookies.txt format")
                 cookie_path.write_bytes(cookie_bytes)
+                instagram_cookie_path = cookie_path
                 options["cookiefile"] = str(cookie_path)
             except (binascii.Error, ValueError, OSError):
                 logger.exception("Invalid INSTAGRAM_COOKIES_BASE64; continuing without Instagram cookies")
@@ -118,6 +121,11 @@ def download_media(url: str, folder: str, audio_only: bool = False, video_qualit
         or hostname.endswith(".youtube.com")
     )
     if is_youtube:
+        options["extractor_args"] = {
+            "youtubepot-bgutilhttp": {
+                "base_url": [os.getenv("BGUTIL_POT_BASE_URL", "http://bgutil-pot-provider.railway.internal:4416")]
+            }
+        }
         encoded_cookies = os.getenv("YOUTUBE_COOKIES_BASE64", "").strip()
         if encoded_cookies:
             cookie_path = Path(folder) / "youtube-cookies.txt"
@@ -135,8 +143,38 @@ def download_media(url: str, folder: str, audio_only: bool = False, video_qualit
                     "Invalid YOUTUBE_COOKIES_BASE64; continuing without YouTube cookies"
                 )
 
-    with yt_dlp.YoutubeDL(options) as ydl:
-        info = ydl.extract_info(url, download=True)
+    try:
+        with yt_dlp.YoutubeDL(options) as ydl:
+            info = ydl.extract_info(url, download=True)
+    except yt_dlp.utils.DownloadError:
+        # Instagram-only fallback: gallery-dl can use the same Netscape cookies file.
+        # It is limited to video files and the configured Telegram size ceiling.
+        if not is_instagram or audio_only:
+            raise
+        command = [
+            "gallery-dl", "--quiet", "--no-input",
+            "--directory", folder,
+            "--filesize-max", "49M",
+            "--filter", "extension in ('mp4', 'mkv', 'webm', 'mov', 'm4v')",
+        ]
+        if instagram_cookie_path and instagram_cookie_path.is_file():
+            command.extend(["--cookies", str(instagram_cookie_path)])
+        command.append(url)
+        try:
+            subprocess.run(command, check=True, capture_output=True, text=True, timeout=240)
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as fallback_error:
+            logger.warning("gallery-dl Instagram fallback failed: %s", str(fallback_error)[:500])
+            raise
+        fallback_files = [
+            p for p in Path(folder).rglob("*")
+            if p.is_file() and p.suffix.lower() in {".mp4", ".mkv", ".webm", ".mov", ".m4v"}
+        ]
+        if not fallback_files:
+            raise FileNotFoundError("gallery-dl did not produce an Instagram video file")
+        final_fallback = max(fallback_files, key=lambda p: p.stat().st_mtime)
+        if final_fallback.stat().st_size > MAX_FILE_SIZE:
+            raise ValueError("حجم الملف أكبر من 49 ميجابايت.")
+        return str(final_fallback), {"title": final_fallback.stem, "extractor": "gallery-dl"}
 
     allowed_extensions = (
         {".mp3", ".m4a", ".aac", ".opus", ".ogg", ".wav"}
