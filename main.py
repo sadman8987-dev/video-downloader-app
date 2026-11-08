@@ -343,7 +343,7 @@ def main() -> None:
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CallbackQueryHandler(handle_download_choice, pattern=r"^download:(video|audio):"))
+    app.add_handler(CallbackQueryHandler(handle_download_choice, pattern=r"^download:(video|audio|q360|q480|q720|q1080|qbest):"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
 
     logger.info("Video downloader bot is starting; yt-dlp version: %s", yt_dlp.version.__version__)
