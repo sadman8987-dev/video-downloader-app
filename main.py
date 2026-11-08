@@ -107,6 +107,33 @@ def download_media(url: str, folder: str, audio_only: bool = False) -> tuple[str
             except (binascii.Error, ValueError, OSError):
                 logger.exception("Invalid INSTAGRAM_COOKIES_BASE64; continuing without Instagram cookies")
 
+    # Optional YouTube session cookies. Store the Base64 value in Railway Variables only.
+    hostname = (urlparse(url).hostname or "").lower()
+    is_youtube = (
+        hostname == "youtu.be"
+        or hostname == "youtube-nocookie.com"
+        or hostname.endswith(".youtube-nocookie.com")
+        or hostname == "youtube.com"
+        or hostname.endswith(".youtube.com")
+    )
+    if is_youtube:
+        encoded_cookies = os.getenv("YOUTUBE_COOKIES_BASE64", "").strip()
+        if encoded_cookies:
+            cookie_path = Path(folder) / "youtube-cookies.txt"
+            try:
+                cookie_bytes = base64.b64decode(encoded_cookies, validate=True)
+                if not (
+                    cookie_bytes.startswith(b"# Netscape HTTP Cookie File")
+                    or cookie_bytes.startswith(b"# HTTP Cookie File")
+                ):
+                    raise ValueError("YouTube cookies must use Netscape cookies.txt format")
+                cookie_path.write_bytes(cookie_bytes)
+                options["cookiefile"] = str(cookie_path)
+            except (binascii.Error, ValueError, OSError):
+                logger.exception(
+                    "Invalid YOUTUBE_COOKIES_BASE64; continuing without YouTube cookies"
+                )
+
     with yt_dlp.YoutubeDL(options) as ydl:
         info = ydl.extract_info(url, download=True)
 
