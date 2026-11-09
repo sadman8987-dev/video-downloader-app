@@ -3,6 +3,7 @@ import ipaddress
 import logging
 import os
 import shutil
+import secrets
 import socket
 import subprocess
 import tempfile
@@ -40,6 +41,41 @@ router = Router()
 download_slots = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 pending_links: dict[tuple[int, str], str] = {}
 user_busy: set[int] = set()
+PENDING_LINK_TTL = max(60, int(os.getenv("PENDING_LINK_TTL_SECONDS", "900")))
+
+
+async def save_pending_link(user_id: int, token: str, url: str) -> None:
+    """Persist a choice across restarts/replicas when Redis is available."""
+    if redis_client is not None:
+        try:
+            await redis_client.set(f"downloader:pending:{user_id}:{token}", url, ex=PENDING_LINK_TTL)
+            return
+        except Exception as exc:
+            log.warning("Could not persist pending link (%s)", type(exc).__name__)
+    pending_links[(user_id, token)] = url
+    keys = [k for k in pending_links if k[0] == user_id]
+    for old in keys[:-5]:
+        pending_links.pop(old, None)
+
+
+async def get_pending_link(user_id: int, token: str) -> str | None:
+    if redis_client is not None:
+        try:
+            value = await redis_client.get(f"downloader:pending:{user_id}:{token}")
+            if value:
+                return value
+        except Exception as exc:
+            log.warning("Could not read pending link from Redis (%s)", type(exc).__name__)
+    return pending_links.get((user_id, token))
+
+
+async def delete_pending_link(user_id: int, token: str) -> None:
+    pending_links.pop((user_id, token), None)
+    if redis_client is not None:
+        try:
+            await redis_client.delete(f"downloader:pending:{user_id}:{token}")
+        except Exception as exc:
+            log.warning("Could not delete pending link from Redis (%s)", type(exc).__name__)
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -243,7 +279,7 @@ async def help_command(message: Message):
     await message.answer(
         "1) ابعت رابط HTTPS عام.\n2) اختار فيديو أو صوت MP3.\n"
         "3) لو اخترت فيديو، حدد الجودة.\n"
-        "الحدود: 100MB/30 دقيقة افتراضياً. نزّل فقط المحتوى الذي تملك حق تنزيله."
+        f"الحدود: {MAX_FILE_MB}MB/30 دقيقة افتراضياً، والإرسال عبر Telegram حاليًا حتى {TELEGRAM_UPLOAD_LIMIT_MB}MB. نزّل فقط المحتوى الذي تملك حق تنزيله."
     )
 
 
@@ -253,12 +289,8 @@ async def receive_link(message: Message):
     if not valid_public_url(url):
         await message.answer("ابعت رابط HTTP/HTTPS عام وصحيح من منصة مدعومة.")
         return
-    token = str(int(time.time()))[-7:] + str(message.from_user.id)[-3:]
-    pending_links[(message.from_user.id, token)] = url
-    # Bound memory use for each user.
-    keys = [k for k in pending_links if k[0] == message.from_user.id]
-    for old in keys[:-5]:
-        pending_links.pop(old, None)
+    token = secrets.token_urlsafe(8).replace("-", "").replace("_", "")[:11]
+    await save_pending_link(message.from_user.id, token, url)
     keyboard = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="🎬 فيديو", callback_data=f"dl:video:{token}"),
         InlineKeyboardButton(text="🎵 صوت MP3", callback_data=f"dl:audio:{token}"),
@@ -274,7 +306,7 @@ async def choose_download(callback: CallbackQuery, bot: Bot):
         return
     _, choice, token = parts
     key = (callback.from_user.id, token)
-    url = pending_links.get(key)
+    url = await get_pending_link(callback.from_user.id, token)
     if not url:
         await callback.message.edit_text("انتهى الاختيار. ابعت الرابط مرة تانية.")
         return
@@ -309,7 +341,7 @@ async def choose_download(callback: CallbackQuery, bot: Bot):
             await callback.message.answer("عندك عملية تحميل شغالة بالفعل. استنى لما تخلص.")
             return
     user_busy.add(user_id)
-    pending_links.pop(key, None)
+    await delete_pending_link(user_id, token)
     status = await callback.message.edit_text("⏳ جاري تجهيز التحميل...")
     try:
         async with download_slots:
@@ -385,8 +417,11 @@ async def main():
     bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher()
     dp.include_router(router)
-    log.info("Bot starting; yt-dlp=%s aria2=%s max_file=%sMB",
-             yt_dlp.version.__version__, bool(shutil.which("aria2c")), MAX_FILE_MB)
+    log.info(
+        "Bot starting; yt-dlp=%s aria2=%s redis=%s max_file=%sMB upload_limit=%sMB",
+        yt_dlp.version.__version__, bool(shutil.which("aria2c")),
+        redis_client is not None, MAX_FILE_MB, TELEGRAM_UPLOAD_LIMIT_MB,
+    )
     try:
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
