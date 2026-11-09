@@ -4,6 +4,7 @@ import logging
 import os
 import shutil
 import socket
+import subprocess
 import tempfile
 import time
 from pathlib import Path
@@ -169,7 +170,30 @@ def download_media(url: str, folder: str, mode: str, quality: str) -> tuple[str,
             approx = info.get("filesize") or info.get("filesize_approx")
             if approx and approx > MAX_FILE_BYTES:
                 raise ValueError(f"الحجم المتوقع أكبر من {MAX_FILE_MB}MB.")
-            return _download_once(url, folder, mode, quality)
+            try:
+                return _download_once(url, folder, mode, quality)
+            except yt_dlp.utils.DownloadError:
+                host = (urlparse(url).hostname or "").lower()
+                is_instagram = host == "instagram.com" or host.endswith(".instagram.com")
+                if is_instagram and mode == "video" and shutil.which("gallery-dl"):
+                    command = [
+                        "gallery-dl", "--quiet", "--no-mtime",
+                        "--directory", folder,
+                        "--filter", "extension in ('mp4', 'mkv', 'webm', 'mov', 'm4v')",
+                        url,
+                    ]
+                    subprocess.run(command, check=True, capture_output=True, text=True, timeout=180)
+                    found = [
+                        p for p in Path(folder).rglob("*")
+                        if p.is_file() and p.suffix.lower() in {".mp4", ".mkv", ".webm", ".mov", ".m4v"}
+                    ]
+                    if not found:
+                        raise FileNotFoundError("gallery-dl لم ينتج ملف فيديو.")
+                    final = max(found, key=lambda p: p.stat().st_mtime)
+                    if final.stat().st_size > MAX_FILE_BYTES:
+                        raise ValueError(f"حجم الملف أكبر من الحد المسموح ({MAX_FILE_MB}MB).")
+                    return str(final), {"title": final.stem, "extractor": "gallery-dl"}
+                raise
         except ValueError:
             raise
         except Exception as exc:
