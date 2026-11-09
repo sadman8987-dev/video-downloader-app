@@ -113,7 +113,6 @@ def _extractor_options(url: str, folder: str | None = None) -> dict:
     options = {}
     social_hosts = ("facebook.com", "instagram.com", "tiktok.com", "twitter.com", "x.com")
     if any(host == domain or host.endswith("." + domain) for domain in social_hosts):
-        options["impersonate"] = "chrome"
         if SOCIAL_COOKIES_BASE64 and folder:
             try:
                 cookie_path = Path(folder) / "social-cookies.txt"
