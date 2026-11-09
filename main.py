@@ -121,11 +121,16 @@ def download_media(url: str, folder: str, audio_only: bool = False, video_qualit
         or hostname.endswith(".youtube.com")
     )
     if is_youtube:
+        # Try clients that are currently less likely to trigger YouTube's
+        # web-client login challenge. The bgutil provider supplies PO tokens
+        # for clients that need them; it cannot bypass IP-based login blocks.
         options["extractor_args"] = {
+            "youtube": {
+                "player_client": ["mweb", "tv", "web_safari"],
+            },
             "youtubepot-bgutilhttp": {
                 "base_url": [os.getenv("BGUTIL_POT_BASE_URL", "http://bgutil-pot-provider.railway.internal:4416")],
-                "disable_innertube": ["1"],
-            }
+            },
         }
         encoded_cookies = os.getenv("YOUTUBE_COOKIES_BASE64", "").strip()
         if encoded_cookies:
