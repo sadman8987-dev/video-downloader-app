@@ -295,12 +295,14 @@ async def choose_download(callback: CallbackQuery, bot: Bot):
         return
     lock_value = f"{user_id}:{token}:{time.time_ns()}"
     redis_locked = False
+    redis_check_succeeded = False
     if redis_client is not None:
         try:
             redis_locked = bool(await redis_client.set(f"downloader:user:{user_id}:busy", lock_value, nx=True, ex=DOWNLOAD_TIMEOUT + 120))
+            redis_check_succeeded = True
         except Exception as exc:
             log.warning("Redis lock unavailable (%s); using process-local lock", type(exc).__name__)
-        if redis_client is not None and not redis_locked:
+        if redis_check_succeeded and not redis_locked:
             await callback.message.answer("عندك عملية تحميل شغالة بالفعل. استنى لما تخلص.")
             return
     user_busy.add(user_id)
