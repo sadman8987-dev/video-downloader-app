@@ -1,398 +1,322 @@
 import asyncio
-import base64
-import binascii
+import ipaddress
 import logging
 import os
-import secrets
-import subprocess
+import shutil
+import socket
 import tempfile
+import time
 from pathlib import Path
 from urllib.parse import urlparse
 
 import yt_dlp
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.constants import ChatAction
-from telegram.ext import (
-    Application,
-    CallbackQueryHandler,
-    CommandHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.filters import Command, CommandStart
+from aiogram.types import (
+    CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
+    Message, FSInputFile,
 )
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-MAX_FILE_SIZE = 100 * 1024 * 1024
-MAX_DURATION_SECONDS = 30 * 60
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+MAX_FILE_MB = int(os.getenv("MAX_FILE_MB", "100"))
+MAX_FILE_BYTES = MAX_FILE_MB * 1024 * 1024
+MAX_DURATION_SECONDS = int(os.getenv("MAX_DURATION_SECONDS", "1800"))
+DOWNLOAD_TIMEOUT = int(os.getenv("DOWNLOAD_TIMEOUT_SECONDS", "600"))
+MAX_CONCURRENT_DOWNLOADS = max(1, int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "2")))
+ENABLE_ARIA2 = os.getenv("ENABLE_ARIA2", "false").lower() in {"1", "true", "yes"}
+BGUTIL_POT_BASE_URL = os.getenv("BGUTIL_POT_BASE_URL", "").strip()
+router = Router()
+download_slots = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
+pending_links: dict[tuple[int, str], str] = {}
+user_busy: set[int] = set()
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
-logger = logging.getLogger("video-downloader")
+log = logging.getLogger("media-downloader")
 
 
-def valid_url(value: str) -> bool:
+def valid_public_url(raw: str) -> bool:
     try:
-        parsed = urlparse(value.strip())
-        return (
-            parsed.scheme in ("http", "https")
-            and bool(parsed.hostname)
-            and not parsed.username
-            and not parsed.password
-        )
-    except ValueError:
+        parsed = urlparse(raw.strip())
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            return False
+        if parsed.username or parsed.password:
+            return False
+        host = parsed.hostname.rstrip(".").lower()
+        if host in {"localhost", "localhost.localdomain"}:
+            return False
+        # Reject literal private/reserved IPs and hostnames resolving to them.
+        try:
+            ip = ipaddress.ip_address(host)
+            return ip.is_global
+        except ValueError:
+            records = socket.getaddrinfo(host, parsed.port or 443, type=socket.SOCK_STREAM)
+            return bool(records) and all(ipaddress.ip_address(r[4][0]).is_global for r in records)
+    except (ValueError, OSError, socket.gaierror):
         return False
 
 
-def download_media(url: str, folder: str, audio_only: bool = False, video_quality: str = "720") -> tuple[str, dict]:
-    output_template = str(Path(folder) / "%(title).80s-%(id)s.%(ext)s")
-    is_instagram = "instagram.com" in (urlparse(url).hostname or "").lower()
-    instagram_cookie_path = None
-    quality_filter = "" if video_quality == "best" else f"[height<={video_quality}]"
-    options = {
-        "http_headers": (
-            {
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/131.0.0.0 Safari/537.36"
-                ),
-                "Accept-Language": "en-US,en;q=0.9",
-                "Referer": "https://www.instagram.com/",
+def _extractor_options(url: str) -> dict:
+    host = (urlparse(url).hostname or "").lower()
+    is_youtube = host == "youtu.be" or host == "youtube.com" or host.endswith(".youtube.com")
+    options = {}
+    if is_youtube:
+        # The provider is optional: use it only when an internal endpoint was configured.
+        if BGUTIL_POT_BASE_URL:
+            options["extractor_args"] = {
+                "youtubepot-bgutilhttp": {"base_url": [BGUTIL_POT_BASE_URL]}
             }
-            if is_instagram else {}
-        ),
-        "format": (
-            "bestaudio[filesize<=100M]/bestaudio/best"
-            if audio_only else
-            f"best{quality_filter}[ext=mp4][filesize<=100M]/"
-            f"best{quality_filter}[filesize<=100M]/"
-            f"best{quality_filter}/best"
-        ),
-        "format_sort": ["abr", "ext:m4a"] if audio_only else (["ext:mp4:m4a"] if video_quality == "best" else [f"res:{video_quality}", "ext:mp4:m4a"]),
-        "outtmpl": output_template,
+    return options
+
+
+def _preflight(url: str) -> dict:
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
         "noplaylist": True,
-        "max_filesize": MAX_FILE_SIZE,
-        "match_filter": yt_dlp.utils.match_filter_func(
-            f"duration <= {MAX_DURATION_SECONDS}"
-        ),
-        "merge_output_format": "mp4",
-        "js_runtimes": {"deno": {}},
-        "remote_components": ["ejs:github"],
+        "skip_download": True,
+        "socket_timeout": 20,
+        "retries": 2,
+        **_extractor_options(url),
+    }
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        return ydl.extract_info(url, download=False)
+
+
+def _download_once(url: str, folder: str, mode: str, quality: str) -> tuple[str, dict]:
+    outtmpl = str(Path(folder) / "%(title).80s-%(id)s.%(ext)s")
+    if mode == "audio":
+        fmt = "bestaudio/best"
+    else:
+        height = "" if quality == "best" else f"[height<={quality}]"
+        fmt = (
+            f"best{height}[ext=mp4]/best{height}/"
+            f"best[ext=mp4]/best"
+        )
+
+    opts = {
+        "format": fmt,
+        "outtmpl": outtmpl,
+        "noplaylist": True,
         "quiet": True,
         "no_warnings": False,
-        "restrictfilenames": True,
         "socket_timeout": 30,
         "retries": 3,
-        "fragment_retries": 3,
+        "fragment_retries": 5,
+        "file_access_retries": 3,
+        "extractor_retries": 3,
         "continuedl": True,
+        "overwrites": True,
+        "max_filesize": MAX_FILE_BYTES,
+        "merge_output_format": "mp4",
+        "windowsfilenames": True,
+        "restrictfilenames": True,
+        **_extractor_options(url),
     }
-
-    if audio_only:
-        options["postprocessors"] = [{
+    if ENABLE_ARIA2 and shutil.which("aria2c"):
+        opts["external_downloader"] = {"http": "aria2c", "https": "aria2c"}
+        opts["external_downloader_args"] = {
+            "aria2c": ["-x", "8", "-s", "8", "-k", "1M", "--file-allocation=none"]
+        }
+    if mode == "audio":
+        opts["postprocessors"] = [{
             "key": "FFmpegExtractAudio",
             "preferredcodec": "mp3",
             "preferredquality": "192",
         }]
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=True)
 
-    # Optional Instagram session cookies. Keep the value in Railway Variables only.
-    if is_instagram:
-        encoded_cookies = os.getenv("INSTAGRAM_COOKIES_BASE64", "").strip()
-        if encoded_cookies:
-            cookie_path = Path(folder) / "instagram-cookies.txt"
-            try:
-                cookie_bytes = base64.b64decode(encoded_cookies, validate=True)
-                if not cookie_bytes.startswith(b"# Netscape HTTP Cookie File") and not cookie_bytes.startswith(b"# HTTP Cookie File"):
-                    raise ValueError("Instagram cookies must use Netscape cookies.txt format")
-                cookie_path.write_bytes(cookie_bytes)
-                instagram_cookie_path = cookie_path
-                options["cookiefile"] = str(cookie_path)
-            except (binascii.Error, ValueError, OSError):
-                logger.exception("Invalid INSTAGRAM_COOKIES_BASE64; continuing without Instagram cookies")
-
-    # Optional YouTube session cookies. Store the Base64 value in Railway Variables only.
-    hostname = (urlparse(url).hostname or "").lower()
-    is_youtube = (
-        hostname == "youtu.be"
-        or hostname == "youtube-nocookie.com"
-        or hostname.endswith(".youtube-nocookie.com")
-        or hostname == "youtube.com"
-        or hostname.endswith(".youtube.com")
-    )
-    if is_youtube:
-        # Try clients that are currently less likely to trigger YouTube's
-        # web-client login challenge. The bgutil provider supplies PO tokens
-        # for clients that need them; it cannot bypass IP-based login blocks.
-        options["extractor_args"] = {
-            "youtube": {
-                "player_client": ["mweb", "tv", "web_safari"],
-            },
-            "youtubepot-bgutilhttp": {
-                "base_url": [os.getenv("BGUTIL_POT_BASE_URL", "http://bgutil-pot-provider.railway.internal:4416")],
-            },
-        }
-        encoded_cookies = os.getenv("YOUTUBE_COOKIES_BASE64", "").strip()
-        if encoded_cookies:
-            cookie_path = Path(folder) / "youtube-cookies.txt"
-            try:
-                cookie_bytes = base64.b64decode(encoded_cookies, validate=True)
-                if not (
-                    cookie_bytes.startswith(b"# Netscape HTTP Cookie File")
-                    or cookie_bytes.startswith(b"# HTTP Cookie File")
-                ):
-                    raise ValueError("YouTube cookies must use Netscape cookies.txt format")
-                cookie_path.write_bytes(cookie_bytes)
-                options["cookiefile"] = str(cookie_path)
-            except (binascii.Error, ValueError, OSError):
-                logger.exception(
-                    "Invalid YOUTUBE_COOKIES_BASE64; continuing without YouTube cookies"
-                )
-
-    try:
-        with yt_dlp.YoutubeDL(options) as ydl:
-            info = ydl.extract_info(url, download=True)
-    except yt_dlp.utils.DownloadError:
-        # Instagram-only fallback: gallery-dl can use the same Netscape cookies file.
-        # It is limited to video files and the configured Telegram size ceiling.
-        if not is_instagram or audio_only:
-            raise
-        command = [
-            "gallery-dl", "--quiet", "--no-input",
-            "--directory", folder,
-            "--filesize-max", "100M",
-            "--filter", "extension in ('mp4', 'mkv', 'webm', 'mov', 'm4v')",
-        ]
-        if instagram_cookie_path and instagram_cookie_path.is_file():
-            command.extend(["--cookies", str(instagram_cookie_path)])
-        command.append(url)
-        try:
-            subprocess.run(command, check=True, capture_output=True, text=True, timeout=240)
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as fallback_error:
-            logger.warning("gallery-dl Instagram fallback failed: %s", str(fallback_error)[:500])
-            raise
-        fallback_files = [
-            p for p in Path(folder).rglob("*")
-            if p.is_file() and p.suffix.lower() in {".mp4", ".mkv", ".webm", ".mov", ".m4v"}
-        ]
-        if not fallback_files:
-            raise FileNotFoundError("gallery-dl did not produce an Instagram video file")
-        final_fallback = max(fallback_files, key=lambda p: p.stat().st_mtime)
-        if final_fallback.stat().st_size > MAX_FILE_SIZE:
-            raise ValueError("حجم الملف أكبر من 100 ميجابايت.")
-        return str(final_fallback), {"title": final_fallback.stem, "extractor": "gallery-dl"}
-
-    allowed_extensions = (
-        {".mp3", ".m4a", ".aac", ".opus", ".ogg", ".wav"}
-        if audio_only else
-        {".mp4", ".mkv", ".webm", ".mov", ".m4v"}
-    )
+    allowed = {".mp3"} if mode == "audio" else {".mp4", ".mkv", ".webm", ".mov", ".m4v"}
     candidates = []
-    for entry in info.get("requested_downloads") or []:
+    for item in info.get("requested_downloads") or []:
         for key in ("filepath", "_filename", "filename"):
-            value = entry.get(key)
-            if value:
-                candidates.append(Path(value))
+            if item.get(key):
+                candidates.append(Path(item[key]))
     for key in ("filepath", "_filename"):
-        value = info.get(key)
-        if value:
-            candidates.append(Path(value))
-    candidates.extend(
-        p for p in Path(folder).rglob("*")
-        if p.is_file() and p.suffix.lower() in allowed_extensions
-    )
-
-    existing = []
-    seen = set()
+        if info.get(key):
+            candidates.append(Path(info[key]))
+    candidates.extend(p for p in Path(folder).rglob("*") if p.is_file() and p.suffix.lower() in allowed)
+    files, seen = [], set()
     for path in candidates:
         try:
             resolved = path.resolve()
-            if resolved not in seen and resolved.is_file() and resolved.suffix.lower() in allowed_extensions:
+            if resolved not in seen and resolved.is_file() and resolved.suffix.lower() in allowed:
                 seen.add(resolved)
-                existing.append(resolved)
+                files.append(resolved)
         except OSError:
-            continue
-
-    if not existing:
-        files_found = [str(p.name) for p in Path(folder).rglob("*") if p.is_file()]
-        logger.error(
-            "yt-dlp returned without a discoverable %s file. extractor=%s id=%s files=%r",
-            "audio" if audio_only else "video", info.get("extractor"), info.get("id"), files_found,
-        )
-        raise FileNotFoundError("yt-dlp did not produce the requested media file")
-
-    final_path = max(existing, key=lambda p: p.stat().st_mtime)
-    if final_path.stat().st_size > MAX_FILE_SIZE:
-        raise ValueError("حجم الملف أكبر من 100 ميجابايت.")
-    return str(final_path), info
+            pass
+    if not files:
+        raise FileNotFoundError("لم يتم العثور على الملف بعد اكتمال التحميل.")
+    final = max(files, key=lambda p: p.stat().st_mtime)
+    if final.stat().st_size <= 0:
+        raise ValueError("الملف الناتج فارغ.")
+    if final.stat().st_size > MAX_FILE_BYTES:
+        raise ValueError(f"حجم الملف أكبر من الحد المسموح ({MAX_FILE_MB}MB).")
+    return str(final), info
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
+def download_media(url: str, folder: str, mode: str, quality: str) -> tuple[str, dict]:
+    last_error = None
+    for attempt in range(1, 4):
+        try:
+            info = _preflight(url)
+            duration = info.get("duration")
+            if duration is not None and duration > MAX_DURATION_SECONDS:
+                raise ValueError(f"مدة الفيديو أطول من {MAX_DURATION_SECONDS // 60} دقيقة.")
+            approx = info.get("filesize") or info.get("filesize_approx")
+            if approx and approx > MAX_FILE_BYTES:
+                raise ValueError(f"الحجم المتوقع أكبر من {MAX_FILE_MB}MB.")
+            return _download_once(url, folder, mode, quality)
+        except ValueError:
+            raise
+        except Exception as exc:
+            last_error = exc
+            log.warning("Download attempt %s/3 failed (%s)", attempt, type(exc).__name__)
+            if attempt < 3:
+                time.sleep(attempt * 2)
+    raise last_error
+
+
+def build_quality_keyboard(token: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="360p", callback_data=f"dl:q360:{token}"),
+            InlineKeyboardButton(text="480p", callback_data=f"dl:q480:{token}"),
+        ],
+        [
+            InlineKeyboardButton(text="720p HD", callback_data=f"dl:q720:{token}"),
+            InlineKeyboardButton(text="1080p", callback_data=f"dl:q1080:{token}"),
+        ],
+        [InlineKeyboardButton(text="⭐ أعلى جودة", callback_data=f"dl:qbest:{token}")],
+    ])
+
+
+@router.message(CommandStart())
+async def start(message: Message):
+    await message.answer(
         "أهلاً بيك في Video Downloader Bot 🎬\n\n"
-        "ابعت رابط فيديو عام من منصة يدعمها yt-dlp، مثل YouTube وShorts "
-        "وTikTok وInstagram وFacebook وX وReddit وVimeo.\n\n"
-        "الحد الأقصى 100MB والمدة 30 دقيقة. قد تختلف الإتاحة حسب المنصة. "
-        "لا يدعم المحتوى الخاص أو المحمي بـ DRM أو الذي يتطلب تسجيل دخول. "
-        "نزّل فقط المحتوى الذي تملك حق تنزيله."
+        "ابعت رابط فيديو عام، وبعدها اختار فيديو أو صوت MP3 والجودة.\n"
+        f"حد التحميل الحالي: {MAX_FILE_MB}MB والمدة: {MAX_DURATION_SECONDS // 60} دقيقة.\n"
+        "قد تختلف الإتاحة حسب المنصة. لا يدعم المحتوى الخاص أو المحمي بـ DRM."
     )
 
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        "طريقة الاستخدام: ابعت رابط الفيديو كاملًا ويبدأ بـ http:// أو https://.\n"
-        "الحد الأقصى 100MB و30 دقيقة. استخدم روابط عامة فقط."
+@router.message(Command("help"))
+async def help_command(message: Message):
+    await message.answer(
+        "1) ابعت رابط HTTPS عام.\n2) اختار فيديو أو صوت MP3.\n"
+        "3) لو اخترت فيديو، حدد الجودة.\n"
+        "الحدود: 100MB/30 دقيقة افتراضياً. نزّل فقط المحتوى الذي تملك حق تنزيله."
     )
 
 
-async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    message = update.effective_message
-    if not message or not message.text:
+@router.message(F.text)
+async def receive_link(message: Message):
+    url = (message.text or "").strip()
+    if not valid_public_url(url):
+        await message.answer("ابعت رابط HTTP/HTTPS عام وصحيح من منصة مدعومة.")
         return
-    url = message.text.strip()
-    if not valid_url(url):
-        await message.reply_text("ابعت رابط صحيح يبدأ بـ http:// أو https://")
-        return
-
-    token = secrets.token_urlsafe(6)
-    pending = context.user_data.setdefault("pending_downloads", {})
-    pending[token] = url
-    # Keep only the newest few pending links per user.
-    while len(pending) > 10:
-        pending.pop(next(iter(pending)))
-
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("🎬 تحميل فيديو", callback_data=f"download:video:{token}"),
-        InlineKeyboardButton("🎵 تحميل صوت MP3", callback_data=f"download:audio:{token}"),
+    token = str(int(time.time()))[-7:] + str(message.from_user.id)[-3:]
+    pending_links[(message.from_user.id, token)] = url
+    # Bound memory use for each user.
+    keys = [k for k in pending_links if k[0] == message.from_user.id]
+    for old in keys[:-5]:
+        pending_links.pop(old, None)
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🎬 فيديو", callback_data=f"dl:video:{token}"),
+        InlineKeyboardButton(text="🎵 صوت MP3", callback_data=f"dl:audio:{token}"),
     ]])
-    await message.reply_text("اختار عايز تحمل إيه:", reply_markup=keyboard)
+    await message.answer("اختار نوع التحميل:", reply_markup=keyboard)
 
 
-async def handle_download_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    if not query:
+@router.callback_query(F.data.startswith("dl:"))
+async def choose_download(callback: CallbackQuery, bot: Bot):
+    await callback.answer()
+    parts = (callback.data or "").split(":")
+    if len(parts) != 3 or not callback.from_user or not callback.message:
         return
-    await query.answer()
-
-    try:
-        parts = query.data.split(":")
-        action = parts[0]
-        choice = parts[1]
-        token = parts[-1]
-    except (AttributeError, IndexError):
-        await query.edit_message_text("❌ الاختيار غير صالح. ابعت الرابط مرة تانية.")
+    _, choice, token = parts
+    key = (callback.from_user.id, token)
+    url = pending_links.get(key)
+    if not url:
+        await callback.message.edit_text("انتهى الاختيار. ابعت الرابط مرة تانية.")
         return
-
-    pending = context.user_data.get("pending_downloads", {})
-    url = pending.get(token)
-    if action != "download" or not url:
-        await query.edit_message_text("انتهت صلاحية الاختيار. ابعت الرابط مرة تانية.")
-        return
-
-    # Video selection opens a quality menu; download starts after a quality is chosen.
     if choice == "video":
-        keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("360p", callback_data=f"download:q360:{token}"),
-                InlineKeyboardButton("480p", callback_data=f"download:q480:{token}"),
-            ],
-            [
-                InlineKeyboardButton("720p HD", callback_data=f"download:q720:{token}"),
-                InlineKeyboardButton("1080p Full HD", callback_data=f"download:q1080:{token}"),
-            ],
-            [InlineKeyboardButton("⭐ أعلى جودة متاحة", callback_data=f"download:qbest:{token}")],
-        ])
-        await query.edit_message_text("اختار جودة الفيديو المطلوبة:", reply_markup=keyboard)
+        await callback.message.edit_text("اختار جودة الفيديو:", reply_markup=build_quality_keyboard(token))
         return
-
     if choice == "audio":
-        audio_only = True
-        video_quality = "720"
+        mode, quality = "audio", "best"
     elif choice.startswith("q"):
-        audio_only = False
-        video_quality = {"q360": "360", "q480": "480", "q720": "720", "q1080": "1080", "qbest": "best"}.get(choice)
-        if not video_quality:
-            await query.edit_message_text("❌ الجودة المختارة غير صالحة.")
+        mode = "video"
+        quality = {"q360": "360", "q480": "480", "q720": "720", "q1080": "1080", "qbest": "best"}.get(choice)
+        if not quality:
+            await callback.message.edit_text("اختيار الجودة غير صالح.")
             return
     else:
-        await query.edit_message_text("❌ الاختيار غير صالح.")
         return
 
-    pending.pop(token, None)
-    await query.edit_message_text(
-        "⏳ جاري تحميل الصوت وتحويله إلى MP3..." if audio_only
-        else f"⏳ جاري تحميل الفيديو بجودة {video_quality if video_quality != 'best' else 'أعلى جودة متاحة'}..."
-    )
-    await context.bot.send_chat_action(
-        chat_id=query.message.chat_id,
-        action=ChatAction.TYPING,
-    )
-
+    user_id = callback.from_user.id
+    if user_id in user_busy:
+        await callback.message.answer("عندك عملية تحميل شغالة بالفعل. استنى لما تخلص.")
+        return
+    user_busy.add(user_id)
+    pending_links.pop(key, None)
+    status = await callback.message.edit_text("⏳ جاري تجهيز التحميل...")
     try:
-        with tempfile.TemporaryDirectory(prefix="telegram-media-") as folder:
-            filename, info = await asyncio.to_thread(
-                download_media, url, folder, audio_only, video_quality
-            )
-            title = (info.get("title") or "الملف")[:900]
-            with open(filename, "rb") as media:
-                if audio_only:
-                    await query.message.reply_audio(
-                        audio=media,
-                        title=title[:64],
-                        read_timeout=180,
-                        write_timeout=180,
-                        connect_timeout=30,
+        async with download_slots:
+            with tempfile.TemporaryDirectory(prefix="telegram-media-") as folder:
+                filename, info = await asyncio.wait_for(
+                    asyncio.to_thread(download_media, url, folder, mode, quality),
+                    timeout=DOWNLOAD_TIMEOUT,
+                )
+                size = Path(filename).stat().st_size
+                title = str(info.get("title") or "ملف")[:64]
+                await status.edit_text("✅ التحميل اكتمل، جاري الإرسال...")
+                media = FSInputFile(filename, filename=Path(filename).name)
+                if mode == "audio":
+                    await bot.send_audio(
+                        chat_id=callback.message.chat.id, audio=media,
+                        title=title, caption="تم التحميل بصيغة MP3",
                     )
                 else:
-                    await query.message.reply_video(
-                        video=media,
-                        caption=f"{title} | الجودة المطلوبة: {video_quality if video_quality != 'best' else 'أعلى جودة متاحة'}",
+                    await bot.send_video(
+                        chat_id=callback.message.chat.id, video=media,
+                        caption=f"{title} | {quality if quality != 'best' else 'أفضل جودة متاحة'}",
                         supports_streaming=True,
-                        read_timeout=180,
-                        write_timeout=180,
-                        connect_timeout=30,
                     )
-            await query.edit_message_text("✅ تم التحميل والإرسال بنجاح.")
+                await status.edit_text(f"✅ تم الإرسال بنجاح ({size / 1024 / 1024:.1f}MB).")
+    except asyncio.TimeoutError:
+        await status.edit_text("انتهت مهلة التحميل. جرّب رابطاً آخر أو جودة أقل.")
     except yt_dlp.utils.DownloadError as exc:
-        error_text = str(exc)
-        logger.error("yt-dlp %s download failed: %s", "audio" if audio_only else "video", error_text, exc_info=True)
-
-        if "Sign in to confirm you're not a bot" in error_text or (
-            "youtube" in error_text.lower() and "cookies" in error_text.lower()
-        ):
-            user_message = (
-                "⚠️ يوتيوب رفض إتاحة الفيديو للسيرفر وطلب تسجيل دخول/تحقق.\n"
-                "البوت شغال، لكن الفيديو ده غير متاح للتنزيل حاليًا من بيئة الاستضافة.\n"
-                "جرّب رابط يوتيوب عام آخر، أو جرّب منصة مدعومة أخرى."
-            )
+        detail = str(exc).lower()
+        log.warning("Extractor/download failure: %s", str(exc)[:700])
+        if "sign in to confirm" in detail or "not a bot" in detail:
+            msg = "يوتيوب طلب تحقق/تسجيل دخول من السيرفر؛ جرّب رابطاً عاماً آخر أو منصة أخرى."
         else:
-            user_message = (
-                "❌ المنصة رفضت التحميل أو الجودة المطلوبة غير متاحة. "
-                "جرّب جودة أقل أو رابطًا عامًا آخر."
-            )
-        await query.edit_message_text(user_message)
+            msg = "المنصة رفضت التحميل أو الرابط/الجودة غير متاحين حالياً. جرّب جودة أقل."
+        await status.edit_text("❌ " + msg)
     except ValueError as exc:
-        await query.edit_message_text(f"❌ {exc}")
+        await status.edit_text("❌ " + str(exc))
     except Exception:
-        logger.exception("Unexpected error while downloading/sending media")
-        await query.edit_message_text(
-            "❌ حصل خطأ أثناء التحميل أو الإرسال. جرّب رابطًا آخر."
-        )
+        log.exception("Unexpected download/send failure")
+        await status.edit_text("❌ حصل خطأ أثناء التحميل أو الإرسال. جرّب مرة أخرى.")
+    finally:
+        user_busy.discard(user_id)
 
 
-def main() -> None:
+async def main():
     if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN environment variable is required")
-
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CallbackQueryHandler(handle_download_choice, pattern=r"^download:(video|audio|q360|q480|q720|q1080|qbest):"))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
-
-    logger.info("Video downloader bot is starting; yt-dlp version: %s", yt_dlp.version.__version__)
-    app.run_polling(drop_pending_updates=True)
+        raise RuntimeError("BOT_TOKEN is missing from Railway Variables.")
+    bot = Bot(token=BOT_TOKEN)
+    dp = Dispatcher()
+    dp.include_router(router)
+    log.info("Bot starting; yt-dlp=%s aria2=%s max_file=%sMB",
+             yt_dlp.version.__version__, bool(shutil.which("aria2c")), MAX_FILE_MB)
+    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
