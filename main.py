@@ -11,6 +11,8 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import yt_dlp
+import sentry_sdk
+from redis.asyncio import Redis
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
@@ -26,6 +28,11 @@ DOWNLOAD_TIMEOUT = int(os.getenv("DOWNLOAD_TIMEOUT_SECONDS", "600"))
 MAX_CONCURRENT_DOWNLOADS = max(1, int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "2")))
 ENABLE_ARIA2 = os.getenv("ENABLE_ARIA2", "false").lower() in {"1", "true", "yes"}
 BGUTIL_POT_BASE_URL = os.getenv("BGUTIL_POT_BASE_URL", "").strip()
+REDIS_URL = os.getenv("REDIS_URL", "").strip()
+SENTRY_DSN = os.getenv("SENTRY_DSN", "").strip()
+redis_client: Redis | None = None
+if SENTRY_DSN:
+    sentry_sdk.init(dsn=SENTRY_DSN, traces_sample_rate=0.0, send_default_pii=False)
 router = Router()
 download_slots = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 pending_links: dict[tuple[int, str], str] = {}
@@ -286,6 +293,16 @@ async def choose_download(callback: CallbackQuery, bot: Bot):
     if user_id in user_busy:
         await callback.message.answer("عندك عملية تحميل شغالة بالفعل. استنى لما تخلص.")
         return
+    lock_value = f"{user_id}:{token}:{time.time_ns()}"
+    redis_locked = False
+    if redis_client is not None:
+        try:
+            redis_locked = bool(await redis_client.set(f"downloader:user:{user_id}:busy", lock_value, nx=True, ex=DOWNLOAD_TIMEOUT + 120))
+        except Exception as exc:
+            log.warning("Redis lock unavailable (%s); using process-local lock", type(exc).__name__)
+        if redis_client is not None and not redis_locked:
+            await callback.message.answer("عندك عملية تحميل شغالة بالفعل. استنى لما تخلص.")
+            return
     user_busy.add(user_id)
     pending_links.pop(key, None)
     status = await callback.message.edit_text("⏳ جاري تجهيز التحميل...")
@@ -315,6 +332,7 @@ async def choose_download(callback: CallbackQuery, bot: Bot):
     except asyncio.TimeoutError:
         await status.edit_text("انتهت مهلة التحميل. جرّب رابطاً آخر أو جودة أقل.")
     except yt_dlp.utils.DownloadError as exc:
+        sentry_sdk.capture_exception(exc)
         detail = str(exc).lower()
         log.warning("Extractor/download failure: %s", str(exc)[:700])
         if "sign in to confirm" in detail or "not a bot" in detail:
@@ -324,22 +342,43 @@ async def choose_download(callback: CallbackQuery, bot: Bot):
         await status.edit_text("❌ " + msg)
     except ValueError as exc:
         await status.edit_text("❌ " + str(exc))
-    except Exception:
+    except Exception as exc:
+        sentry_sdk.capture_exception(exc)
         log.exception("Unexpected download/send failure")
         await status.edit_text("❌ حصل خطأ أثناء التحميل أو الإرسال. جرّب مرة أخرى.")
     finally:
         user_busy.discard(user_id)
+        if redis_locked and redis_client is not None:
+            try:
+                await redis_client.eval("if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end", 1, f"downloader:user:{user_id}:busy", lock_value)
+            except Exception as exc:
+                log.warning("Could not release Redis lock (%s)", type(exc).__name__)
 
 
 async def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN is missing from Railway Variables.")
+    global redis_client
+    if REDIS_URL:
+        try:
+            redis_client = Redis.from_url(REDIS_URL, socket_connect_timeout=3, socket_timeout=3, decode_responses=True)
+            await redis_client.ping()
+            log.info("Redis connected; distributed per-user locks enabled")
+        except Exception as exc:
+            log.warning("Redis unavailable (%s); falling back to local locks", type(exc).__name__)
+            if redis_client is not None:
+                await redis_client.aclose()
+            redis_client = None
     bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher()
     dp.include_router(router)
     log.info("Bot starting; yt-dlp=%s aria2=%s max_file=%sMB",
              yt_dlp.version.__version__, bool(shutil.which("aria2c")), MAX_FILE_MB)
-    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+    try:
+        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+    finally:
+        if redis_client is not None:
+            await redis_client.aclose()
 
 
 if __name__ == "__main__":
