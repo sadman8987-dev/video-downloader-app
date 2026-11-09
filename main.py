@@ -22,8 +22,8 @@ from telegram.ext import (
 )
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-MAX_FILE_SIZE = 49 * 1024 * 1024
-MAX_DURATION_SECONDS = 20 * 60
+MAX_FILE_SIZE = 100 * 1024 * 1024
+MAX_DURATION_SECONDS = 30 * 60
 
 logging.basicConfig(
     level=logging.INFO,
@@ -64,10 +64,10 @@ def download_media(url: str, folder: str, audio_only: bool = False, video_qualit
             if is_instagram else {}
         ),
         "format": (
-            "bestaudio[filesize<=49M]/bestaudio/best"
+            "bestaudio[filesize<=100M]/bestaudio/best"
             if audio_only else
-            f"best{quality_filter}[ext=mp4][filesize<=49M]/"
-            f"best{quality_filter}[filesize<=49M]/"
+            f"best{quality_filter}[ext=mp4][filesize<=100M]/"
+            f"best{quality_filter}[filesize<=100M]/"
             f"best{quality_filter}/best"
         ),
         "format_sort": ["abr", "ext:m4a"] if audio_only else (["ext:mp4:m4a"] if video_quality == "best" else [f"res:{video_quality}", "ext:mp4:m4a"]),
@@ -160,7 +160,7 @@ def download_media(url: str, folder: str, audio_only: bool = False, video_qualit
         command = [
             "gallery-dl", "--quiet", "--no-input",
             "--directory", folder,
-            "--filesize-max", "49M",
+            "--filesize-max", "100M",
             "--filter", "extension in ('mp4', 'mkv', 'webm', 'mov', 'm4v')",
         ]
         if instagram_cookie_path and instagram_cookie_path.is_file():
@@ -179,7 +179,7 @@ def download_media(url: str, folder: str, audio_only: bool = False, video_qualit
             raise FileNotFoundError("gallery-dl did not produce an Instagram video file")
         final_fallback = max(fallback_files, key=lambda p: p.stat().st_mtime)
         if final_fallback.stat().st_size > MAX_FILE_SIZE:
-            raise ValueError("حجم الملف أكبر من 49 ميجابايت.")
+            raise ValueError("حجم الملف أكبر من 100 ميجابايت.")
         return str(final_fallback), {"title": final_fallback.stem, "extractor": "gallery-dl"}
 
     allowed_extensions = (
@@ -223,7 +223,7 @@ def download_media(url: str, folder: str, audio_only: bool = False, video_qualit
 
     final_path = max(existing, key=lambda p: p.stat().st_mtime)
     if final_path.stat().st_size > MAX_FILE_SIZE:
-        raise ValueError("حجم الملف أكبر من 49 ميجابايت.")
+        raise ValueError("حجم الملف أكبر من 100 ميجابايت.")
     return str(final_path), info
 
 
@@ -232,7 +232,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "أهلاً بيك في Video Downloader Bot 🎬\n\n"
         "ابعت رابط فيديو عام من منصة يدعمها yt-dlp، مثل YouTube وShorts "
         "وTikTok وInstagram وFacebook وX وReddit وVimeo.\n\n"
-        "الحد الأقصى 49MB والمدة 20 دقيقة. قد تختلف الإتاحة حسب المنصة. "
+        "الحد الأقصى 100MB والمدة 30 دقيقة. قد تختلف الإتاحة حسب المنصة. "
         "لا يدعم المحتوى الخاص أو المحمي بـ DRM أو الذي يتطلب تسجيل دخول. "
         "نزّل فقط المحتوى الذي تملك حق تنزيله."
     )
@@ -241,7 +241,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "طريقة الاستخدام: ابعت رابط الفيديو كاملًا ويبدأ بـ http:// أو https://.\n"
-        "الحد الأقصى 49MB و20 دقيقة. استخدم روابط عامة فقط."
+        "الحد الأقصى 100MB و30 دقيقة. استخدم روابط عامة فقط."
     )
 
 
