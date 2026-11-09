@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import ipaddress
 import logging
 import os
@@ -32,6 +33,7 @@ DOWNLOAD_TIMEOUT = int(os.getenv("DOWNLOAD_TIMEOUT_SECONDS", "600"))
 MAX_CONCURRENT_DOWNLOADS = max(1, int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "2")))
 ENABLE_ARIA2 = os.getenv("ENABLE_ARIA2", "false").lower() in {"1", "true", "yes"}
 BGUTIL_POT_BASE_URL = os.getenv("BGUTIL_POT_BASE_URL", "").strip()
+SOCIAL_COOKIES_BASE64 = os.getenv("SOCIAL_COOKIES_BASE64", "").strip()
 REDIS_URL = os.getenv("REDIS_URL", "").strip()
 SENTRY_DSN = os.getenv("SENTRY_DSN", "").strip()
 redis_client: Redis | None = None
@@ -105,10 +107,22 @@ def valid_public_url(raw: str) -> bool:
         return False
 
 
-def _extractor_options(url: str) -> dict:
+def _extractor_options(url: str, folder: str | None = None) -> dict:
     host = (urlparse(url).hostname or "").lower()
     is_youtube = host == "youtu.be" or host == "youtube.com" or host.endswith(".youtube.com")
     options = {}
+    social_hosts = ("facebook.com", "instagram.com", "tiktok.com", "twitter.com", "x.com")
+    if any(host == domain or host.endswith("." + domain) for domain in social_hosts):
+        options["impersonate"] = "chrome"
+        if SOCIAL_COOKIES_BASE64 and folder:
+            try:
+                cookie_path = Path(folder) / "social-cookies.txt"
+                if not cookie_path.exists():
+                    cookie_path.write_bytes(base64.b64decode(SOCIAL_COOKIES_BASE64, validate=True))
+                    os.chmod(cookie_path, 0o600)
+                options["cookiefile"] = str(cookie_path)
+            except Exception as exc:
+                log.warning("Social cookies could not be loaded (%s)", type(exc).__name__)
     if is_youtube:
         # The provider is optional: use it only when an internal endpoint was configured.
         if BGUTIL_POT_BASE_URL:
@@ -118,7 +132,7 @@ def _extractor_options(url: str) -> dict:
     return options
 
 
-def _preflight(url: str) -> dict:
+def _preflight(url: str, folder: str) -> dict:
     opts = {
         "quiet": True,
         "no_warnings": True,
@@ -126,7 +140,7 @@ def _preflight(url: str) -> dict:
         "skip_download": True,
         "socket_timeout": 20,
         "retries": 2,
-        **_extractor_options(url),
+        **_extractor_options(url, folder),
     }
     with yt_dlp.YoutubeDL(opts) as ydl:
         return ydl.extract_info(url, download=False)
@@ -209,7 +223,7 @@ def download_media(url: str, folder: str, mode: str, quality: str) -> tuple[str,
     last_error = None
     for attempt in range(1, 4):
         try:
-            info = _preflight(url)
+            info = _preflight(url, folder)
             duration = info.get("duration")
             if duration is not None and duration > MAX_DURATION_SECONDS:
                 raise ValueError(f"مدة الفيديو أطول من {MAX_DURATION_SECONDS // 60} دقيقة.")
