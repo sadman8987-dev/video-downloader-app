@@ -174,7 +174,7 @@ def _download_once(url: str, folder: str, mode: str, quality: str) -> tuple[str,
         "merge_output_format": "mp4",
         "windowsfilenames": True,
         "restrictfilenames": True,
-        **_extractor_options(url),
+        **_extractor_options(url, folder),
     }
     if ENABLE_ARIA2 and shutil.which("aria2c"):
         opts["external_downloader"] = {"http": "aria2c", "https": "aria2c"}
