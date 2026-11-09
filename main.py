@@ -235,7 +235,7 @@ def download_media(url: str, folder: str, mode: str, quality: str) -> tuple[str,
             except yt_dlp.utils.DownloadError:
                 host = (urlparse(url).hostname or "").lower()
                 is_instagram = host == "instagram.com" or host.endswith(".instagram.com")
-                if is_instagram and mode == "video" and shutil.which("gallery-dl"):
+                if is_instagram and shutil.which("gallery-dl"):
                     command = [
                         "gallery-dl", "--quiet", "--no-mtime",
                         "--directory", folder,
@@ -248,11 +248,20 @@ def download_media(url: str, folder: str, mode: str, quality: str) -> tuple[str,
                         if p.is_file() and p.suffix.lower() in {".mp4", ".mkv", ".webm", ".mov", ".m4v"}
                     ]
                     if not found:
-                        raise FileNotFoundError("gallery-dl لم ينتج ملف فيديو.")
-                    final = max(found, key=lambda p: p.stat().st_mtime)
+                        raise FileNotFoundError("لم يتم العثور على ملف وسائط من Instagram.")
+                    source = max(found, key=lambda p: p.stat().st_mtime)
+                    if mode == "audio":
+                        final = Path(folder) / (source.stem + ".mp3")
+                        subprocess.run(
+                            ["ffmpeg", "-y", "-i", str(source), "-vn", "-codec:a", "libmp3lame",
+                             "-b:a", "192k", str(final)],
+                            check=True, capture_output=True, text=True, timeout=180,
+                        )
+                    else:
+                        final = source
                     if final.stat().st_size > MAX_FILE_BYTES:
                         raise ValueError(f"حجم الملف أكبر من الحد المسموح ({MAX_FILE_MB}MB).")
-                    return str(final), {"title": final.stem, "extractor": "gallery-dl"}
+                    return str(final), {"title": source.stem, "extractor": "gallery-dl"}
                 raise
         except ValueError:
             raise
