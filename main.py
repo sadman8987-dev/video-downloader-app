@@ -23,6 +23,9 @@ from aiogram.types import (
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 MAX_FILE_MB = int(os.getenv("MAX_FILE_MB", "100"))
 MAX_FILE_BYTES = MAX_FILE_MB * 1024 * 1024
+# Telegram cloud Bot API upload ceiling; keep a safety margin below 50 MB.
+TELEGRAM_UPLOAD_LIMIT_MB = int(os.getenv("TELEGRAM_UPLOAD_LIMIT_MB", "49"))
+TELEGRAM_UPLOAD_LIMIT_BYTES = TELEGRAM_UPLOAD_LIMIT_MB * 1024 * 1024
 MAX_DURATION_SECONDS = int(os.getenv("MAX_DURATION_SECONDS", "1800"))
 DOWNLOAD_TIMEOUT = int(os.getenv("DOWNLOAD_TIMEOUT_SECONDS", "600"))
 MAX_CONCURRENT_DOWNLOADS = max(1, int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "2")))
@@ -317,6 +320,14 @@ async def choose_download(callback: CallbackQuery, bot: Bot):
                 )
                 size = Path(filename).stat().st_size
                 title = str(info.get("title") or "ملف")[:64]
+                if size > TELEGRAM_UPLOAD_LIMIT_BYTES:
+                    await status.edit_text(
+                        f"⚠️ تم تنزيل الملف بنجاح ({size / 1024 / 1024:.1f}MB)، "
+                        f"لكن Telegram Bot API لا يسمح للبوت برفع ملفات بهذا الحجم عبر "
+                        f"الخادم السحابي. الحد العملي الحالي {TELEGRAM_UPLOAD_LIMIT_MB}MB. "
+                        "جرّب جودة أقل أو ملفًا أصغر."
+                    )
+                    return
                 await status.edit_text("✅ التحميل اكتمل، جاري الإرسال...")
                 media = FSInputFile(filename, filename=Path(filename).name)
                 if mode == "audio":
